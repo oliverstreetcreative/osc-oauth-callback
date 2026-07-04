@@ -1,9 +1,0 @@
-{
-  "name": "osc-oauth-callback",
-  "version": "1.0.0",
-  "scripts": { "start": "node index.js" },
-  "dependencies": {
-    "express": "^4.18.0",
-    "resend": "^3.0.0"
-  }
-}
