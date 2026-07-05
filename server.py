@@ -10,21 +10,25 @@ into a real server, keeping the same repo/Railway service so the redirect_uri
 already registered with Kroger (https://osc-oauth-callback-production.up.
 railway.app/kroger/callback) didn't need to change.
 
-Auth model (two independent layers):
-- Front door (protects the MCP tools from the public internet): a single
-  static bearer token, checked via a TokenVerifier subclass. Simpler than the
-  GitHub OAuth allowlist used by the OSC Fastmail proxy since this doesn't
-  need per-human identity — just needs to not be wide open to the internet.
-  Set MCP_BEARER_TOKEN and configure the same value wherever this server is
-  added as a connector.
-- Kroger auth: standard OAuth2. product.compact/profile.compact via
-  client_credentials (app-only, no user needed) covers search/locations.
-  cart.basic:write requires a user-linked token, obtained once via a real
-  browser consent (authorization_code grant) — Sam visits the URL from
-  kroger_get_authorize_url(), logs in, Kroger redirects to /kroger/callback
-  here, which exchanges the code for an access+refresh token pair.
+Auth model (two independent OAuth flows, serving different purposes):
+- Front door (protects the MCP tools from the public internet): **GitHub
+  OAuth, restricted to an allowlist of GitHub logins** — identical pattern to
+  the OSC Fastmail proxy, upgraded to this from an earlier static-bearer-token
+  design once it was clear a shared secret sitting in a config file was a
+  real (if modest) liability compared to a real per-identity login. OAuth
+  authenticates *who you are*; the allowlist decides *who's allowed*. Fails
+  CLOSED: if the login claim is ever absent, the request is denied.
+- Kroger auth: standard OAuth2, unrelated to the above. product.compact/
+  profile.compact via client_credentials (app-only, no user needed) covers
+  search/locations. cart.basic:write requires a user-linked token, obtained
+  once via a real browser consent (authorization_code grant) — Sam visits the
+  URL from kroger_get_authorize_url(), logs in, Kroger redirects to
+  /kroger/callback here, which exchanges the code for an access+refresh
+  token pair. This callback route is deliberately public/unauthenticated
+  (Kroger's server can't present a GitHub login) — protected instead by the
+  OAuth `state` CSRF check and by only accepting a code Kroger itself issued.
 
-Persistence: deliberately simple for a single-user personal tool. The
+Persistence: deliberately simple for a single-user personal tool. The Kroger
 refresh_token lives in an in-process variable, lost on restart unless
 persisted as the KROGER_REFRESH_TOKEN env var (see README for the one-time
 bootstrap: authorize -> GET /admin/refresh-token -> `railway variable set`).
@@ -39,9 +43,18 @@ Env:
   KROGER_REFRESH_TOKEN   — optional at boot. If set, cart tools work
                            immediately; if not, kroger_get_authorize_url
                            explains how to bootstrap it.
-  MCP_BEARER_TOKEN       — static bearer token required to call any MCP tool.
+  GITHUB_CLIENT_ID       — GitHub OAuth app client id (separate app from the
+                           Fastmail proxy's — different callback URL, GitHub
+                           OAuth Apps only support one callback URL each).
+  GITHUB_CLIENT_SECRET   — GitHub OAuth app client secret.
+  PUBLIC_BASE_URL        — public https base (must match the GitHub OAuth
+                           callback, i.e. <base>/auth/callback).
+  GITHUB_ALLOWED_USERS   — comma-separated GitHub logins allowed (default:
+                           the owner).
   ADMIN_TOKEN            — separate static token required to hit
-                           /admin/refresh-token (see README bootstrap flow).
+                           /admin/refresh-token (see README bootstrap flow) —
+                           this is an operator/CLI endpoint, not something
+                           Claude calls, so a static token here is fine.
   PORT                   — injected by Railway.
 """
 
@@ -54,8 +67,7 @@ from urllib.parse import urlencode
 
 import httpx
 from fastmcp import FastMCP
-from fastmcp.server.auth import TokenVerifier
-from mcp.server.auth.provider import AccessToken
+from fastmcp.server.auth.providers.github import GitHubProvider
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 
@@ -64,8 +76,16 @@ logger = logging.getLogger("osc.kroger")
 KROGER_CLIENT_ID = os.environ["KROGER_CLIENT_ID"]
 KROGER_CLIENT_SECRET = os.environ["KROGER_CLIENT_SECRET"]
 KROGER_REDIRECT_URI = os.environ["KROGER_REDIRECT_URI"]
-MCP_BEARER_TOKEN = os.environ["MCP_BEARER_TOKEN"]
+GITHUB_CLIENT_ID = os.environ["GITHUB_CLIENT_ID"]
+GITHUB_CLIENT_SECRET = os.environ["GITHUB_CLIENT_SECRET"]
+PUBLIC_BASE_URL = os.environ["PUBLIC_BASE_URL"]
 ADMIN_TOKEN = os.environ["ADMIN_TOKEN"]
+
+ALLOWED_LOGINS = {
+    u.strip().lower()
+    for u in os.environ.get("GITHUB_ALLOWED_USERS", "oliverstreetcreative").split(",")
+    if u.strip()
+}
 
 KROGER_BASE = "https://api.kroger.com/v1"
 TOKEN_URL = f"{KROGER_BASE}/connect/oauth2/token"
@@ -82,24 +102,31 @@ _state = {
 }
 
 
-class StaticBearerVerifier(TokenVerifier):
-    """Single shared-secret bearer token — proportionate for a personal
-    single-user tool. See the Fastmail proxy for the GitHub-OAuth-allowlist
-    pattern used where per-human identity actually matters."""
+class AllowlistedGitHubProvider(GitHubProvider):
+    """GitHub OAuth, but only for an allowlist of logins. Fails closed.
+    Identical to the OSC Fastmail proxy's provider — kept as a separate copy
+    rather than a shared import since these are two different repos."""
 
-    def __init__(self, expected_token: str, **kwargs):
-        super().__init__(**kwargs)
-        self._expected = expected_token
-
-    async def verify_token(self, token: str) -> AccessToken | None:
-        if secrets.compare_digest(token, self._expected):
-            return AccessToken(token=token, client_id="osc", scopes=[])
+    async def verify_token(self, token):
+        result = await super().verify_token(token)
+        if result is None:
+            return None
+        login = ((getattr(result, "claims", None) or {}).get("login") or "").lower()
+        if login and login in ALLOWED_LOGINS:
+            return result
+        logger.warning("Rejected GitHub login not on allowlist: %r", login or "<none>")
         return None
 
 
+auth = AllowlistedGitHubProvider(
+    client_id=GITHUB_CLIENT_ID,
+    client_secret=GITHUB_CLIENT_SECRET,
+    base_url=PUBLIC_BASE_URL,
+)
+
 mcp = FastMCP(
     name="OSC - Kroger Grocery Assistant",
-    auth=StaticBearerVerifier(MCP_BEARER_TOKEN),
+    auth=auth,
 )
 
 
@@ -282,7 +309,8 @@ async def admin_get_refresh_token(request: Request):
     """One-time retrieval endpoint so the refresh_token can be persisted as a
     durable Railway env var after the bootstrap browser consent, without ever
     putting it in the Kroger redirect response or in logs. Requires
-    ADMIN_TOKEN as a bearer header — a separate secret from MCP_BEARER_TOKEN."""
+    ADMIN_TOKEN as a bearer header — unrelated to the GitHub OAuth used for
+    the actual MCP tool calls, this is an operator/CLI-only endpoint."""
     auth_header = request.headers.get("authorization", "")
     if auth_header != f"Bearer {ADMIN_TOKEN}":
         return JSONResponse({"error": "unauthorized"}, status_code=401)
